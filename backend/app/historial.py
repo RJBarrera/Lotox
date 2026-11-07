@@ -1,7 +1,7 @@
 """Consultas parametrizadas a tablas existentes; sin operaciones de escritura."""
 
-from collections import Counter
 from dataclasses import dataclass
+from random import Random
 from secrets import SystemRandom
 
 from .db import conexion_lectura
@@ -110,7 +110,38 @@ def verificar_combinacion(modalidad: str, numeros: list[int]) -> dict:
             "ultimas_coincidencias": coincidencias}
 
 
-def _muestra_ponderada_sin_reemplazo(pesos: list[tuple[int, float]], cantidad: int, rng: SystemRandom) -> list[int]:
+
+def combinaciones_repetidas(modalidad: str, limite: int = 5) -> dict:
+    """Devuelve solo combinaciones principales repetidas más de una vez.
+
+    Los identificadores SQL salen exclusivamente del catálogo estático MODALIDADES.
+    No mezcla R7, ni utiliza información de otra modalidad.
+    """
+    cfg = MODALIDADES[modalidad]
+    columnas = ", ".join(cfg.columnas)
+    consulta = (
+        f"SELECT {columnas}, COUNT(*)::int AS repeticiones, MAX(fecha) AS ultima_fecha "
+        f"FROM {cfg.tabla} GROUP BY {columnas} HAVING COUNT(*) > 1 "
+        f"ORDER BY repeticiones DESC, ultima_fecha DESC, {columnas} LIMIT %s"
+    )
+    with conexion_lectura() as conn:
+        with conn.cursor() as cur:
+            cur.execute(consulta, (limite,))
+            filas = cur.fetchall()
+    return {
+        "modalidad": modalidad,
+        "data": [
+            {
+                "numeros": [fila[col] for col in cfg.columnas],
+                "repeticiones": fila["repeticiones"],
+                "ultima_fecha": fila["ultima_fecha"],
+            }
+            for fila in filas
+        ],
+    }
+
+
+def _muestra_ponderada_sin_reemplazo(pesos: list[tuple[int, float]], cantidad: int, rng: Random) -> list[int]:
     disponibles = list(pesos)
     resultado: list[int] = []
     for _ in range(cantidad):
@@ -127,28 +158,48 @@ def _muestra_ponderada_sin_reemplazo(pesos: list[tuple[int, float]], cantidad: i
     return sorted(resultado)
 
 
+def generar_desde_ranking(cfg: Configuracion, ranking: list[dict], cantidad: int,
+                         estrategia: str, rng: Random | None = None) -> list[list[int]]:
+    """Motor compartido: no consulta datos ni conoce el sorteo que será evaluado."""
+    if not 1 <= cantidad <= 5:
+        raise ValueError("La cantidad debe estar entre 1 y 5.")
+    # Método de los cuatro Python originales: ventanas consecutivas del ranking
+    # de números más frecuentes. Es determinista para un mismo historial/ventana.
+    if estrategia == "clasica":
+        numeros = [fila["numero"] for fila in ranking]
+        tamano = len(cfg.columnas)
+        combinaciones = [sorted(numeros[i:i + tamano]) for i in range(cantidad)]
+    else:
+        conteos = {f["numero"]: f["apariciones"] for f in ranking}
+        media = sum(conteos.values()) / cfg.maximo
+        if estrategia == "frecuencia":
+            pesos = [(numero, float(conteos[numero] + 1)) for numero in range(1, cfg.maximo + 1)]
+        elif estrategia == "equilibrada":
+            pesos = [(numero, 0.5 + 0.5 * ((conteos[numero] + 1) / (media + 1))) for numero in range(1, cfg.maximo + 1)]
+        else:
+            raise ValueError("Estrategia desconocida.")
+        rng = rng if rng is not None else SystemRandom()
+        combinaciones: list[list[int]] = []
+        vistos: set[tuple[int, ...]] = set()
+        for _ in range(250):
+            combinacion = _muestra_ponderada_sin_reemplazo(pesos, len(cfg.columnas), rng)
+            llave = tuple(combinacion)
+            if llave not in vistos:
+                combinaciones.append(combinacion)
+                vistos.add(llave)
+            if len(combinaciones) == cantidad:
+                break
+        if len(combinaciones) != cantidad:
+            raise ValueError("No se pudieron generar suficientes combinaciones distintas.")
+    return combinaciones
+
+
 def generar_combinaciones(modalidad: str, cantidad: int, ventana: int, estrategia: str) -> dict:
     cfg = MODALIDADES[modalidad]
     datos = frecuencias(modalidad, ventana)
     if not datos["sorteos_analizados"]:
         raise ValueError("No hay sorteos históricos disponibles para generar combinaciones.")
-    conteos = {f["numero"]: f["apariciones"] for f in datos["ranking"]}
-    media = sum(conteos.values()) / cfg.maximo
-    if estrategia == "frecuencia":
-        pesos = [(numero, float(conteos[numero] + 1)) for numero in range(1, cfg.maximo + 1)]
-    else:  # equilibrada: mezcla de frecuencia y componente uniforme, sin afirmar ventaja.
-        pesos = [(numero, 0.5 + 0.5 * ((conteos[numero] + 1) / (media + 1))) for numero in range(1, cfg.maximo + 1)]
-    rng = SystemRandom()
-    combinaciones: list[list[int]] = []
-    vistos: set[tuple[int, ...]] = set()
-    for _ in range(250):
-        combinacion = _muestra_ponderada_sin_reemplazo(pesos, len(cfg.columnas), rng)
-        llave = tuple(combinacion)
-        if llave not in vistos:
-            combinaciones.append(combinacion)
-            vistos.add(llave)
-        if len(combinaciones) == cantidad:
-            break
+    combinaciones = generar_desde_ranking(cfg, datos["ranking"], cantidad, estrategia)
     return {"modalidad": modalidad, "estrategia": estrategia, "ventana": ventana,
             "sorteos_analizados": datos["sorteos_analizados"], "combinaciones": combinaciones,
             "advertencia": "Son combinaciones heurísticas, no predicciones con ventaja matemática. En sorteos justos todas las combinaciones válidas son equiprobables."}

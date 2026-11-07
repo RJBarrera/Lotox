@@ -8,9 +8,13 @@ __pycache__/
 .pytest_cache/
 # Configuración privada
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+!**/.env.example
 # Editor / sistema
 .vscode/
 .idea/
 .DS_Store
+
+# Archivos temporales de asistentes de IDE
+.tsupgrader/

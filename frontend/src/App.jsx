@@ -1,13 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { catalogoLocal } from './competencias';
-
-const apiBase = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
-
-async function consultar(path) {
-  const response = await fetch(`${apiBase}/api/v1/${path}`, { signal: AbortSignal.timeout(12000) });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.json();
-}
+import { consultar, crearSolicitudVigente } from './api';
+import BacktestingPanel from './BacktestingPanel';
 
 const CircleIcon = ({ size = 17 }) => (
   <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -44,6 +38,7 @@ function App() {
   const [modalidad, setModalidad] = useState(null);
   const [resumen, setResumen] = useState(null);
   const [historial, setHistorial] = useState([]);
+  const [repetidas, setRepetidas] = useState([]);
   const [frecuencia, setFrecuencia] = useState(null);
   const [estadoDatos, setEstadoDatos] = useState('pendiente');
   const [errorDatos, setErrorDatos] = useState('');
@@ -55,23 +50,46 @@ function App() {
   const [numerosConsulta, setNumerosConsulta] = useState('');
   const [verificacion, setVerificacion] = useState(null);
   const [verificando, setVerificando] = useState(false);
+  const solicitudes = useRef(null);
+  if (!solicitudes.current) {
+    solicitudes.current = { generacion: crearSolicitudVigente(), verificacion: crearSolicitudVigente() };
+  }
+
+  useEffect(() => () => {
+    solicitudes.current.generacion.cancelar();
+    solicitudes.current.verificacion.cancelar();
+  }, []);
+
+  const limpiarResultados = () => {
+    solicitudes.current.generacion.cancelar();
+    solicitudes.current.verificacion.cancelar();
+    setGenerando(false);
+    setVerificando(false);
+    setCombinaciones([]);
+    setVerificacion(null);
+    setPredError('');
+  };
 
   useEffect(() => {
     if (vista !== 'detalle' || !modalidad) return;
     let activo = true;
+    const controlador = new AbortController();
     setEstadoDatos('cargando');
     setErrorDatos('');
     setCombinaciones([]);
     setVerificacion(null);
+    setRepetidas([]);
     Promise.all([
-      consultar(`modalidades/${modalidad}/resumen`),
-      consultar(`modalidades/${modalidad}/historial?limite=8`),
-      consultar(`modalidades/${modalidad}/frecuencias?ventana=${ventana}`),
-    ]).then(([res, his, fre]) => {
+      consultar(`modalidades/${modalidad}/resumen`, { signal: controlador.signal }),
+      consultar(`modalidades/${modalidad}/historial?limite=8`, { signal: controlador.signal }),
+      consultar(`modalidades/${modalidad}/frecuencias?ventana=${ventana}`, { signal: controlador.signal }),
+      consultar(`modalidades/${modalidad}/combinaciones-repetidas?limite=5`, { signal: controlador.signal }),
+    ]).then(([res, his, fre, rep]) => {
       if (!activo) return;
       setResumen(res);
       setHistorial(his.data || []);
       setFrecuencia(fre);
+      setRepetidas(rep.data || []);
       setEstadoDatos('listo');
     }).catch((error) => {
       if (!activo) return;
@@ -80,35 +98,40 @@ function App() {
       setResumen(null);
       setHistorial([]);
       setFrecuencia(null);
+      setRepetidas([]);
     });
-    return () => { activo = false; };
+    return () => { activo = false; controlador.abort(); };
   }, [vista, modalidad, ventana]);
 
   const generar = async () => {
+    const solicitud = solicitudes.current.generacion.iniciar();
     setGenerando(true);
     setPredError('');
     setCombinaciones([]);
     try {
-      const result = await consultar(`modalidades/${modalidad}/predicciones?cantidad=3&ventana=${ventana}&estrategia=${estrategia}`);
+      const result = await consultar(`modalidades/${modalidad}/predicciones?cantidad=3&ventana=${ventana}&estrategia=${estrategia}`, { signal: solicitud.signal });
+      if (!solicitud.vigente()) return;
       setCombinaciones(result.combinaciones || []);
     } catch (error) {
-      setPredError(`No fue posible generar combinaciones: ${error.message}`);
+      if (solicitud.vigente()) setPredError(`No fue posible generar combinaciones: ${error.message}`);
     } finally {
-      setGenerando(false);
+      if (solicitud.vigente()) setGenerando(false);
     }
   };
 
   const verificar = async (e) => {
     e.preventDefault();
+    const solicitud = solicitudes.current.verificacion.iniciar();
     setVerificando(true);
     setVerificacion(null);
     try {
-      const result = await consultar(`modalidades/${modalidad}/verificar?numeros=${encodeURIComponent(numerosConsulta)}`);
+      const result = await consultar(`modalidades/${modalidad}/verificar?numeros=${encodeURIComponent(numerosConsulta)}`, { signal: solicitud.signal });
+      if (!solicitud.vigente()) return;
       setVerificacion({ ...result, valido: true });
     } catch (error) {
-      setVerificacion({ valido: false, mensaje: `Revisa la combinación. ${error.message}` });
+      if (solicitud.vigente()) setVerificacion({ valido: false, mensaje: error.message });
     } finally {
-      setVerificando(false);
+      if (solicitud.vigente()) setVerificando(false);
     }
   };
 
@@ -128,6 +151,7 @@ function App() {
   }, []);
 
   const entrar = (competencia) => {
+    limpiarResultados();
     setSeleccion(competencia.id);
     setModalidad(competencia.modalidades[0].id);
     setNumerosConsulta('');
@@ -136,6 +160,7 @@ function App() {
   };
 
   const volver = () => {
+    limpiarResultados();
     setVista('inicio');
     setSeleccion(null);
     setModalidad(null);
@@ -162,7 +187,7 @@ function App() {
           ))}
         </nav>
         <div className="sidebar-bottom">
-          <span className="feature-tag"><span className="tag-dot" /> MOTOR INICIAL · V0.3</span>
+          <span className="feature-tag"><span className="tag-dot" /> MOTOR INICIAL · V0.4</span>
           <p>Datos históricos y combinaciones heurísticas.</p>
         </div>
       </aside>
@@ -226,7 +251,7 @@ function App() {
               <div className="section-heading section-heading-small"><div><span className="eyebrow">SELECCIONA EL SORTEO</span><h2>Modalidades</h2></div></div>
               <div className="mode-tabs" role="tablist" aria-label="Modalidades">
                 {competenciaActual?.modalidades.map((item) => (
-                  <button key={item.id} type="button" role="tab" aria-selected={modalidad === item.id} className={modalidad === item.id ? 'mode-tab selected' : 'mode-tab'} onClick={() => { setModalidad(item.id); setNumerosConsulta(''); }}>{item.nombre}</button>
+                  <button key={item.id} type="button" role="tab" aria-selected={modalidad === item.id} className={modalidad === item.id ? 'mode-tab selected' : 'mode-tab'} onClick={() => { limpiarResultados(); setModalidad(item.id); setNumerosConsulta(''); }}>{item.nombre}</button>
                 ))}
               </div>
               <div className="detail-summary">
@@ -245,16 +270,17 @@ function App() {
 
                 <section className="lotox-panel">
                   <div className="panel-heading"><div><span className="eyebrow">MOTOR LOTOX · VERSIÓN INICIAL</span><h2>Generador de combinaciones</h2></div><span className="meta-chip">Experimental</span></div>
-                  <p className="panel-description">Genera tres combinaciones usando una muestra ponderada de números según sus apariciones históricas. No son resultados garantizados ni predicciones con ventaja matemática.</p>
+                  <p className="panel-description">Genera tres combinaciones mediante el método de tus Python originales o estrategias ponderadas. Ninguna tiene ventaja matemática demostrada.</p>
                   <div className="controls-line">
                     <label className="field-label">Estrategia
-                      <select value={estrategia} onChange={e => { setEstrategia(e.target.value); setCombinaciones([]); }}>
+                      <select value={estrategia} onChange={e => { limpiarResultados(); setEstrategia(e.target.value); }}>
                         <option value="equilibrada">Equilibrada (frecuencia + uniformidad)</option>
-                        <option value="frecuencia">Frecuencia histórica</option>
+                        <option value="frecuencia">Frecuencia histórica ponderada</option>
+                        <option value="clasica">Método original: números más frecuentes</option>
                       </select>
                     </label>
                     <label className="field-label">Ventana de análisis
-                      <select value={ventana} onChange={e => setVentana(Number(e.target.value))}>
+                      <select value={ventana} onChange={e => { limpiarResultados(); setVentana(Number(e.target.value)); }}>
                         <option value={100}>Últimos 100 sorteos</option>
                         <option value={500}>Últimos 500 sorteos</option>
                         <option value={1000}>Últimos 1000 sorteos</option>
@@ -267,6 +293,8 @@ function App() {
                   {combinaciones.length > 0 && <div className="prediction-list">{combinaciones.map((nums, idx) => <div className="prediction-row" key={idx}><span className="prediction-label">PROPUESTA {idx + 1}</span><FilaNumeros numeros={nums} /></div>)}</div>}
                   <p className="muted-note">Las frecuencias pasadas no cambian la probabilidad de cada combinación en un sorteo justo.</p>
                 </section>
+
+                <BacktestingPanel key={modalidad} modalidad={modalidad} />
 
                 <div className="data-grid">
                   <section className="lotox-panel">
@@ -284,9 +312,20 @@ function App() {
                   </section>
                 </div>
                 <section className="lotox-panel">
+                  <div className="panel-heading"><div><span className="eyebrow">HISTORIAL DE RESULTADOS</span><h2>Combinaciones más repetidas</h2></div><span className="meta-chip">TOP 5</span></div>
+                  <p className="panel-description">Combinaciones principales que aparecen en más de un sorteo de esta modalidad. No incluyen el adicional R7.</p>
+                  {repetidas.length ? <div className="prediction-list">{repetidas.map((item, idx) => (
+                    <div className="prediction-row" key={item.numeros.join('-')}>
+                      <span className="prediction-label">#{idx + 1} · {item.repeticiones} veces</span>
+                      <FilaNumeros numeros={item.numeros} />
+                      <small>Última aparición: {item.ultima_fecha}</small>
+                    </div>
+                  ))}</div> : <p className="muted-note">No se encontraron combinaciones repetidas en el historial cargado.</p>}
+                </section>
+                <section className="lotox-panel">
                   <div className="panel-heading"><div><span className="eyebrow">EXPLORADOR DE COMBINACIONES</span><h2>Buscar en el historial</h2></div></div>
                   <p className="panel-description">Introduce {modalidadActual?.numeros_por_sorteo} números separados por comas para comprobar si aparecieron juntos en algún sorteo.</p>
-                  <form className="verify-form" onSubmit={verificar}><input aria-label="Números separados por coma" type="text" required placeholder={modalidad === 'chispazo' ? 'Ejemplo: 1, 5, 9, 17, 22' : 'Ejemplo: 1, 5, 9, 17, 22, 45'} value={numerosConsulta} onChange={e => setNumerosConsulta(e.target.value)} /><button type="submit" className="secondary-button" disabled={verificando}>{verificando ? 'Consultando…' : 'Verificar'}</button></form>
+                  <form className="verify-form" onSubmit={verificar}><input aria-label="Números separados por coma" type="text" required placeholder={modalidad === 'chispazo' ? 'Ejemplo: 1, 5, 9, 17, 22' : 'Ejemplo: 1, 5, 9, 17, 22, 45'} value={numerosConsulta} onChange={e => { solicitudes.current.verificacion.cancelar(); setVerificando(false); setVerificacion(null); setNumerosConsulta(e.target.value); }} /><button type="submit" className="secondary-button" disabled={verificando}>{verificando ? 'Consultando…' : 'Verificar'}</button></form>
                   {verificacion && <p className={verificacion.valido ? 'result-note' : 'error-note'}>{verificacion.valido ? `Esta combinación aparece ${verificacion.apariciones_historicas} veces en el historial cargado.` : verificacion.mensaje}</p>}
                 </section>
                 <div className="info-banner"><span className="info-icon">i</span><p><strong>Datos reales de tu PostgreSQL.</strong> Los resultados se limitan a las fechas cargadas en tus tablas. La comprobación de combinaciones y las estadísticas no permiten conocer el próximo sorteo.</p></div>

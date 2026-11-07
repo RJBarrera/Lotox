@@ -7,16 +7,17 @@ import psycopg
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
+from .backtesting import evaluar_estrategias
 from .catalogo import COMPETENCIAS
 from .db import DatabaseNotConfigured, conexion_lectura
 from .historial import (
     configuracion, resumen, listar_sorteos, frecuencias, verificar_combinacion,
-    generar_combinaciones,
+    generar_combinaciones, combinaciones_repetidas,
 )
 
 logger = logging.getLogger("lotox")
 
-app = FastAPI(title="LotoX API", description="API de análisis estadístico de loterías. Solo lectura de PostgreSQL.", version="0.3.0")
+app = FastAPI(title="LotoX API", description="API de análisis estadístico de loterías. Solo lectura de PostgreSQL.", version="0.5.0")
 origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if o.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=False,
                    allow_methods=["GET"], allow_headers=["*"])
@@ -42,7 +43,7 @@ def validar_modalidad(modalidad: str):
 
 @app.get("/api/v1/health", tags=["Sistema"])
 def health():
-    return {"status": "ok", "service": "lotox-api", "version": "0.3.0"}
+    return {"status": "ok", "service": "lotox-api", "version": "0.5.0"}
 
 
 @app.get("/api/v1/db/health", tags=["Sistema"])
@@ -88,12 +89,29 @@ def verificar(modalidad: str, numeros: str = Query(..., description="Ejemplo: 1,
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@app.get("/api/v1/modalidades/{modalidad}/combinaciones-repetidas", tags=["Estadística"])
+def obtener_combinaciones_repetidas(modalidad: str, limite: int = Query(5, ge=1, le=10)):
+    validar_modalidad(modalidad)
+    return combinaciones_repetidas(modalidad, limite)
+
+
 @app.get("/api/v1/modalidades/{modalidad}/predicciones", tags=["Motor"])
 def predicciones(modalidad: str, cantidad: int = Query(3, ge=1, le=5),
                  ventana: int = Query(500, ge=0, le=20000),
-                 estrategia: str = Query("equilibrada", pattern="^(equilibrada|frecuencia)$")):
+                 estrategia: str = Query("equilibrada", pattern="^(equilibrada|frecuencia|clasica)$")):
     validar_modalidad(modalidad)
     try:
         return generar_combinaciones(modalidad, cantidad, ventana, estrategia)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/modalidades/{modalidad}/backtesting", tags=["Motor"])
+def backtesting(modalidad: str, evaluaciones: int = Query(100, ge=10, le=500),
+                entrenamiento_minimo: int = Query(100, ge=30, le=2000),
+                ventana: int = Query(500, ge=30, le=5000), semilla: int = Query(42, ge=0, le=2147483647)):
+    validar_modalidad(modalidad)
+    try:
+        return evaluar_estrategias(modalidad, evaluaciones, entrenamiento_minimo, ventana, semilla)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
